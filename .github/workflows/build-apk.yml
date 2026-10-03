@@ -1,0 +1,141 @@
+# Builds the Android APK from a .zip that you upload to the repo root.
+# Put this file at:  .github/workflows/build-apk.yml
+#
+# Usage: upload ONE project zip (e.g. yala-no-playstore-build.zip) to the
+# repository root. The workflow unzips it, builds a release APK and publishes
+# it as a GitHub Release (and as a workflow artifact).
+
+name: Build APK from ZIP
+
+on:
+  push:
+    paths:
+      - '*.zip'
+      - '.github/workflows/build-apk.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Unzip and build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Unzip project
+        run: |
+          set -euo pipefail
+          ZIP="$(ls -1t ./*.zip 2>/dev/null | head -n 1 || true)"
+          if [ -z "$ZIP" ]; then
+            echo "::error::No .zip file found in the repository root."
+            exit 1
+          fi
+          echo "Using $ZIP"
+          mkdir -p _src
+          unzip -q -o "$ZIP" -d _src
+          PUBSPEC="$(find _src -maxdepth 3 -name pubspec.yaml | head -n 1)"
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::pubspec.yaml not found inside the zip."
+            exit 1
+          fi
+          APP_DIR="$(dirname "$PUBSPEC")"
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          echo "Project directory: $APP_DIR"
+
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: '3.47.1'
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter pub get
+
+      - name: Analyze (informational, shows compile errors early)
+        working-directory: ${{ env.APP_DIR }}
+        continue-on-error: true
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Prepare signing key
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KS_KEYPASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KS="$RUNNER_TEMP/release.jks"
+          if [ -n "$KS_B64" ] && [ -n "$KS_PASS" ] && [ -n "$KS_ALIAS" ] && [ -n "$KS_KEYPASS" ]; then
+            echo "Using the keystore from repository secrets."
+            echo "$KS_B64" | base64 --decode > "$KS"
+            PASS="$KS_PASS"; ALIAS="$KS_ALIAS"; KPASS="$KS_KEYPASS"
+          else
+            echo "No signing secrets found. Generating a temporary key."
+            PASS="$(openssl rand -hex 16)"; ALIAS="yala"; KPASS="$PASS"
+            keytool -genkeypair -keystore "$KS" -storetype PKCS12 \
+              -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PASS" -keypass "$KPASS" \
+              -dname "CN=YALA CI, O=nightcode, C=IN"
+          fi
+          echo "::add-mask::$PASS"
+          echo "::add-mask::$KPASS"
+          {
+            echo "KEYSTORE_PATH=$KS"
+            echo "KEYSTORE_PASSWORD=$PASS"
+            echo "KEY_ALIAS=$ALIAS"
+            echo "KEY_PASSWORD=$KPASS"
+          } >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter build apk --release --flavor community
+
+      - name: Collect APK
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find "$APP_DIR/build/app/outputs" -name '*.apk' -exec cp {} dist/ \;
+          ls -lh dist
+          if ! ls dist/*.apk >/dev/null 2>&1; then
+            echo "::error::No APK was produced."
+            exit 1
+          fi
+
+      - name: Upload APK as workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yala-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: build-${{ github.run_number }}
+          name: YALA build ${{ github.run_number }}
+          commit: ${{ github.sha }}
+          artifacts: dist/*.apk
+          prerelease: true
+          allowUpdates: true
+          body: |
+            APK built automatically from the uploaded zip.
+            Commit: ${{ github.sha }}
