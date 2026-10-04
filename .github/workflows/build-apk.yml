@@ -1,11 +1,8 @@
-# Builds the Android APK from a .zip that you upload to the repo root.
-# Put this file at:  .github/workflows/build-apk.yml
-#
-# Usage: upload ONE project zip (e.g. openwrt-controller.zip) to the
-# repository root. The workflow unzips it, builds a release APK and publishes
-# it as a GitHub Release (and as a workflow artifact).
+# Maraj Wallpaper (Android TV) - zip se APK banata hai.
+# Is file ko repo me yahan rakho:  .github/workflows/build-apk.yml
+# Phir repo ke root me maraj_wallpaper.zip upload karo. Baaki sab automatic.
 
-name: Build OpenWrt Controller APK
+name: Build Maraj Wallpaper APK
 
 on:
   push:
@@ -37,7 +34,7 @@ jobs:
           set -euo pipefail
           ZIP="$(ls -1t ./*.zip 2>/dev/null | head -n 1 || true)"
           if [ -z "$ZIP" ]; then
-            echo "::error::No .zip file found in the repository root."
+            echo "::error::Repo root me koi .zip file nahi mili."
             exit 1
           fi
           echo "Using $ZIP"
@@ -45,7 +42,7 @@ jobs:
           unzip -q -o "$ZIP" -d _src
           PUBSPEC="$(find _src -maxdepth 3 -name pubspec.yaml | head -n 1)"
           if [ -z "$PUBSPEC" ]; then
-            echo "::error::pubspec.yaml not found inside the zip."
+            echo "::error::Zip ke andar pubspec.yaml nahi mili."
             exit 1
           fi
           APP_DIR="$(dirname "$PUBSPEC")"
@@ -61,68 +58,55 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
-          flutter-version: '3.47.1'
           channel: stable
           cache: true
+
+      - name: Create Android platform (agar zip me android/ nahi hai)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          if [ ! -d android ]; then
+            flutter create --platforms=android --org com.maraj --project-name maraj_wallpaper .
+          fi
+
+      - name: Android TV manifest patch
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          if grep -q "LEANBACK_LAUNCHER" android/app/src/main/AndroidManifest.xml; then
+            echo "Manifest pehle se patched hai."
+          else
+            python3 tools/patch_manifest.py
+          fi
 
       - name: Install dependencies
         working-directory: ${{ env.APP_DIR }}
         run: flutter pub get
 
-      - name: Analyze (informational, shows compile errors early)
+      - name: Analyze (informational)
         working-directory: ${{ env.APP_DIR }}
         continue-on-error: true
         run: flutter analyze --no-fatal-infos --no-fatal-warnings
 
-      - name: Prepare signing key
-        env:
-          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          KS_KEYPASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          KS="$RUNNER_TEMP/release.jks"
-          if [ -n "$KS_B64" ] && [ -n "$KS_PASS" ] && [ -n "$KS_ALIAS" ] && [ -n "$KS_KEYPASS" ]; then
-            echo "Using the keystore from repository secrets."
-            echo "$KS_B64" | base64 --decode > "$KS"
-            PASS="$KS_PASS"; ALIAS="$KS_ALIAS"; KPASS="$KS_KEYPASS"
-          else
-            echo "No signing secrets found. Generating a temporary key."
-            PASS="$(openssl rand -hex 16)"; ALIAS="owc"; KPASS="$PASS"
-            keytool -genkeypair -keystore "$KS" -storetype PKCS12 \
-              -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass "$PASS" -keypass "$KPASS" \
-              -dname "CN=OpenWrt Controller CI, O=RichardDawkinsIN, C=IN"
-          fi
-          echo "::add-mask::$PASS"
-          echo "::add-mask::$KPASS"
-          {
-            echo "KEYSTORE_PATH=$KS"
-            echo "KEYSTORE_PASSWORD=$PASS"
-            echo "KEY_ALIAS=$ALIAS"
-            echo "KEY_PASSWORD=$KPASS"
-          } >> "$GITHUB_ENV"
-
       - name: Build release APK
         working-directory: ${{ env.APP_DIR }}
-        run: flutter build apk --release --flavor community
+        run: flutter build apk --release --split-per-abi
 
       - name: Collect APK
         run: |
           set -euo pipefail
           mkdir -p dist
-          find "$APP_DIR/build/app/outputs" -name '*.apk' -exec cp {} dist/ \;
+          find "$APP_DIR/build/app/outputs" -name '*-release.apk' -exec cp {} dist/ \;
           ls -lh dist
           if ! ls dist/*.apk >/dev/null 2>&1; then
-            echo "::error::No APK was produced."
+            echo "::error::APK nahi bani."
             exit 1
           fi
 
       - name: Upload APK as workflow artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: openwrt-controller-apk
+          name: maraj-wallpaper-apk
           path: dist/*.apk
           if-no-files-found: error
 
@@ -131,11 +115,12 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           tag: build-${{ github.run_number }}
-          name: OpenWrt Controller build ${{ github.run_number }}
+          name: Maraj Wallpaper build ${{ github.run_number }}
           commit: ${{ github.sha }}
           artifacts: dist/*.apk
           prerelease: true
           allowUpdates: true
           body: |
-            APK built automatically from the uploaded zip.
+            Maraj Wallpaper (Android TV) APK, uploaded zip se automatically bani.
+            Zyadatar TV ke liye arm64-v8a ya armeabi-v7a wali APK install karo.
             Commit: ${{ github.sha }}
