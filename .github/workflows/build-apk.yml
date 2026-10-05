@@ -1,0 +1,127 @@
+# Maraj Wallpaper (Android phone + Jio STB) - builds a single APK from the uploaded zip.
+# Put this file at:  .github/workflows/build-apk.yml
+# Then upload maraj_wallpaper.zip to the repo root. Everything else is automatic.
+
+name: Build Maraj Wallpaper APK (Phone + Jio STB)
+
+on:
+  push:
+    paths:
+      - '*.zip'
+      - '.github/workflows/build-apk.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Unzip and build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Unzip project
+        run: |
+          set -euo pipefail
+          ZIP="$(ls -1t ./*.zip 2>/dev/null | head -n 1 || true)"
+          if [ -z "$ZIP" ]; then
+            echo "::error::Repo root me koi .zip file nahi mili."
+            exit 1
+          fi
+          echo "Using $ZIP"
+          mkdir -p _src
+          unzip -q -o "$ZIP" -d _src
+          PUBSPEC="$(find _src -maxdepth 3 -name pubspec.yaml | head -n 1)"
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::Zip ke andar pubspec.yaml nahi mili."
+            exit 1
+          fi
+          APP_DIR="$(dirname "$PUBSPEC")"
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          echo "Project directory: $APP_DIR"
+
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create Android platform (agar zip me android/ nahi hai)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          if [ ! -d android ]; then
+            flutter create --platforms=android --org com.maraj --project-name maraj_wallpaper .
+          fi
+
+      - name: Android TV manifest patch
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          if grep -q "LEANBACK_LAUNCHER" android/app/src/main/AndroidManifest.xml; then
+            echo "Manifest pehle se patched hai."
+          else
+            python3 tools/patch_manifest.py
+          fi
+
+      - name: Install dependencies
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter pub get
+
+      - name: Analyze (informational)
+        working-directory: ${{ env.APP_DIR }}
+        continue-on-error: true
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build release APK
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter build apk --release --target-platform android-arm,android-arm64 --obfuscate --split-debug-info=build/debug-info
+
+      - name: Collect APK
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          APK="$(find "$APP_DIR/build/app/outputs" -name '*-release.apk' | head -n 1)"
+          [ -n "$APK" ] && cp "$APK" "dist/MarajWallpaper-build${{ github.run_number }}.apk"
+          ls -lh dist
+          if ! ls dist/*.apk >/dev/null 2>&1; then
+            echo "::error::APK nahi bani."
+            exit 1
+          fi
+
+      - name: Upload APK as workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: maraj-wallpaper-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: build-${{ github.run_number }}
+          name: Maraj Wallpaper build ${{ github.run_number }}
+          commit: ${{ github.sha }}
+          artifacts: dist/*.apk
+          prerelease: true
+          allowUpdates: true
+          body: |
+            Maraj Wallpaper APK for Android phones and Jio STB, built automatically from the uploaded zip.
+            One universal APK (armeabi-v7a + arm64-v8a): install directly on a phone, or on the STB with adb install.
+            Commit: ${{ github.sha }}
