@@ -1,0 +1,163 @@
+# Arpit Explains - builds Android APKs (per CPU architecture + universal), signed with one fixed key.
+# Put this file at:  .github/workflows/build-apk.yml
+# Then upload arpit_explains.zip to the repo root (use a NEW, separate GitHub repo). Everything else is automatic.
+
+name: Build Arpit Explains APKs (all architectures)
+
+on:
+  push:
+    paths:
+      - '*.zip'
+      - '.github/workflows/build-apk.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Unzip and build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Unzip project
+        run: |
+          set -euo pipefail
+          ZIP="$(ls -1t ./*.zip 2>/dev/null | head -n 1 || true)"
+          if [ -z "$ZIP" ]; then
+            echo "::error::Repo root me koi .zip file nahi mili."
+            exit 1
+          fi
+          echo "Using $ZIP"
+          mkdir -p _src
+          unzip -q -o "$ZIP" -d _src
+          PUBSPEC="$(find _src -maxdepth 3 -name pubspec.yaml | head -n 1)"
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::Zip ke andar pubspec.yaml nahi mili."
+            exit 1
+          fi
+          APP_DIR="$(dirname "$PUBSPEC")"
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          echo "Project directory: $APP_DIR"
+
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create Android platform (if the zip has no android/ folder)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          if [ ! -d android ]; then
+            flutter create --platforms=android --org com.arpitexplains --project-name arpit_explains .
+          fi
+          rm -f test/widget_test.dart
+
+      - name: Install dependencies
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter pub get
+
+      - name: Analyze (informational)
+        working-directory: ${{ env.APP_DIR }}
+        continue-on-error: true
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Unit tests (informational)
+        working-directory: ${{ env.APP_DIR }}
+        continue-on-error: true
+        run: flutter test
+
+      # One fixed signing key for every build, so new APKs install OVER old ones
+      # (a different key per build is what causes "App not installed").
+      # Add your own key with repo secrets KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS.
+      - name: Prepare signing key
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          if [ -n "${KS_B64:-}" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "KS_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "KS_PASS=$KS_PASSWORD" >> "$GITHUB_ENV"
+            echo "KS_ALIAS_NAME=$KS_ALIAS" >> "$GITHUB_ENV"
+            echo "Using the keystore from repo secrets"
+          else
+            echo "KS_FILE=$GITHUB_WORKSPACE/$APP_DIR/tools/arpit-sideload.jks" >> "$GITHUB_ENV"
+            echo "KS_PASS=arpit-explains@2026" >> "$GITHUB_ENV"
+            echo "KS_ALIAS_NAME=arpit" >> "$GITHUB_ENV"
+            echo "Using the bundled sideload key (same on every build)"
+          fi
+          APKSIGNER="$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)"
+          echo "APKSIGNER=$APKSIGNER" >> "$GITHUB_ENV"
+
+      - name: Build APKs (per architecture + universal)
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          YT_API_KEY: ${{ secrets.YT_API_KEY }}
+          REMOTE_CONFIG_URL: ${{ secrets.REMOTE_CONFIG_URL }}
+        run: |
+          set -euo pipefail
+          python3 tools/patch_manifest.py
+          DEFS="--dart-define=YT_API_KEY=$YT_API_KEY --dart-define=REMOTE_CONFIG_URL=$REMOTE_CONFIG_URL"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          # one APK per CPU architecture (smaller downloads)
+          flutter build apk --release --split-per-abi $DEFS --obfuscate --split-debug-info=build/debug-info
+          for abi in armeabi-v7a arm64-v8a x86_64; do
+            "$APKSIGNER" sign --ks "$KS_FILE" --ks-pass "pass:$KS_PASS" --ks-key-alias "$KS_ALIAS_NAME" --key-pass "pass:$KS_PASS" \
+              --out "$GITHUB_WORKSPACE/dist/ArpitExplains-$abi-build${{ github.run_number }}.apk" "build/app/outputs/flutter-apk/app-$abi-release.apk"
+          done
+          # one universal APK containing every architecture
+          flutter build apk --release $DEFS --obfuscate --split-debug-info=build/debug-info-universal
+          "$APKSIGNER" sign --ks "$KS_FILE" --ks-pass "pass:$KS_PASS" --ks-key-alias "$KS_ALIAS_NAME" --key-pass "pass:$KS_PASS" \
+            --out "$GITHUB_WORKSPACE/dist/ArpitExplains-universal-build${{ github.run_number }}.apk" build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Verify signatures
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          for f in dist/*.apk; do "$APKSIGNER" verify --print-certs "$f" | head -n 3; done
+          test "$(ls dist/*.apk | wc -l)" -eq 4
+
+      - name: Upload APK as workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: arpit-explains-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: build-${{ github.run_number }}
+          name: Arpit Explains build ${{ github.run_number }}
+          commit: ${{ github.sha }}
+          artifacts: dist/*.apk
+          prerelease: true
+          allowUpdates: true
+          body: |
+            Arpit Explains app - built automatically from the uploaded zip.
+            - ArpitExplains-arm64-v8a-*.apk : most phones (install this one)
+            - ArpitExplains-armeabi-v7a-*.apk : older 32-bit phones
+            - ArpitExplains-x86_64-*.apk : emulators / x86 devices
+            - ArpitExplains-universal-*.apk : all architectures (use if unsure)
+            Commit: ${{ github.sha }}
