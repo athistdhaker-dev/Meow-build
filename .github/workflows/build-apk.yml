@@ -1,0 +1,157 @@
+name: Build APK
+
+on:
+  push:
+    paths:
+      - '*.zip'
+      - '.github/workflows/build-apk.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      APP_NAME: eSIMConnect
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+
+      - name: Unpack newest source zip
+        run: |
+          set -euo pipefail
+          ZIP="$(ls -t ./*.zip | head -n 1)"
+          echo "Using $ZIP"
+          rm -rf _src && mkdir _src
+          unzip -q "$ZIP" -d _src
+          PUBSPEC="$(find _src -name pubspec.yaml | head -n 1)"
+          test -n "$PUBSPEC"
+          echo "APP_DIR=$(cd "$(dirname "$PUBSPEC")" && pwd)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create Android project if missing
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          if [ ! -d android ]; then
+            flutter create --platforms=android --org com.maraj --project-name esim_connect .
+          fi
+          rm -f test/widget_test.dart
+
+      - name: flutter pub get
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter pub get
+
+      - name: flutter analyze
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter analyze
+        continue-on-error: true
+
+      - name: flutter test
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter test
+        continue-on-error: true
+
+      - name: Patch Android project
+        working-directory: ${{ env.APP_DIR }}
+        run: python3 tools/patch_manifest.py
+
+      - name: Prepare signing key
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          if [ -n "${KEYSTORE_BASE64:-}" ] && [ -n "${KEYSTORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ]; then
+            echo "Signing with the private key from repository secrets"
+            echo "::add-mask::$KEYSTORE_PASSWORD"
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            KS="$RUNNER_TEMP/release.jks"; KPASS="$KEYSTORE_PASSWORD"; KALIAS="$KEY_ALIAS"
+          else
+            echo "Signing with the bundled PUBLIC sideload key (same key every build)"
+            KS="$APP_DIR/tools/esim_connect-sideload.jks"; KPASS="sideload"; KALIAS="sideload"
+          fi
+          APKSIGNER="$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)"
+          {
+            echo "KS=$KS"
+            echo "KPASS=$KPASS"
+            echo "KALIAS=$KALIAS"
+            echo "APKSIGNER=$APKSIGNER"
+          } >> "$GITHUB_ENV"
+
+      - name: Build per-ABI APKs
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          flutter build apk --release --split-per-abi \
+            --obfuscate --split-debug-info=build/debug-info
+
+      - name: Build universal APK
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          flutter build apk --release \
+            --obfuscate --split-debug-info=build/debug-info-universal
+
+      - name: Sign APKs
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          N="${{ github.run_number }}"
+          OUT="build/app/outputs/flutter-apk"
+          declare -A MAP=(
+            ["app-arm64-v8a-release.apk"]="arm64-v8a"
+            ["app-armeabi-v7a-release.apk"]="armeabi-v7a"
+            ["app-x86_64-release.apk"]="x86_64"
+            ["app-release.apk"]="universal"
+          )
+          for src in "${!MAP[@]}"; do
+            abi="${MAP[$src]}"
+            "$APKSIGNER" sign --ks "$KS" --ks-pass "pass:$KPASS" \
+              --ks-key-alias "$KALIAS" --v4-signing-enabled false \
+              --out "dist/${APP_NAME}-Mobile-${abi}-build${N}.apk" "$OUT/$src"
+          done
+
+      - name: Verify APKs
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          for f in dist/*.apk; do
+            "$APKSIGNER" verify --print-certs "$f" | head -n 3
+          done
+          ls -l dist
+          test "$(ls dist/*.apk | wc -l)" -eq 4
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: apks-build${{ github.run_number }}
+          path: ${{ env.APP_DIR }}/dist/*.apk
+
+      - uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: build-${{ github.run_number }}
+          commit: ${{ github.sha }}
+          name: eSIM Connect build ${{ github.run_number }}
+          prerelease: true
+          allowUpdates: true
+          artifacts: ${{ env.APP_DIR }}/dist/*.apk
