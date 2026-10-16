@@ -1,0 +1,186 @@
+name: Build JIDU6J11 Firmware
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        device: [6111, 6411, 6611, 6811, 6911]
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /var/lib/docker
+          sudo docker image prune --all --force 2>/dev/null || true
+          df -h
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3-setuptools rsync swig unzip zlib1g-dev file wget
+
+      - name: Locate and extract support files zip
+        run: |
+          ZIPFILE=$(find . -maxdepth 1 -name "jidu6j11-build*.zip" | head -n1)
+          if [ -z "$ZIPFILE" ]; then
+            echo "No jidu6j11-build*.zip found at repo root!"
+            exit 1
+          fi
+          unzip -o "$ZIPFILE" -d jidu6j11-src
+          ls jidu6j11-src
+
+      - name: Clone OpenWrt main
+        run: |
+          # Shallow clone — full history is no longer needed now that
+          # we overlay a static files snapshot instead of cherry-picking
+          # PR commits onto a cloned branch.
+          git clone --depth 1 https://github.com/openwrt/openwrt.git src
+
+      - name: Overlay PR #25869 files (static snapshot)
+        run: |
+          # Uses a bundled snapshot of PR #25869's files (jidu6j11-src/pr-files/)
+          # copied directly into the tree, instead of a live "git fetch" +
+          # cherry-pick onto the PR. This avoids the whole class of bugs the
+          # live-fetch approach hit: upstream default-branch rename
+          # (master->main), missing git commit identity on CI runners, and
+          # commits silently skipped on conflict. A plain file copy can't
+          # "skip" or "conflict" — it always lands.
+          #
+          # TRADEOFF: this snapshot was taken on 2026-10-15. If PR #25869
+          # gets new commits after that, this will NOT pick them up — the
+          # pr-files/ folder in the support zip needs to be refreshed
+          # manually. It can also silently overwrite unrelated upstream
+          # changes to the same files if main has moved since the snapshot.
+          cp -a jidu6j11-src/pr-files/. src/
+          echo "Verifying jidu6j11 device landed in the tree:"
+          grep -rl "jidu6j11" src/target/linux/qualcommbe/ || { echo "::error::jidu6j11 not found in tree after overlay — pr-files/ missing or incomplete."; exit 1; }
+
+      - name: Bake uci-defaults + Aurora theme
+        run: |
+          # No custom model-name script needed: each JIDU6J11 variant's
+          # own .dts already sets "model = ..." directly, unlike
+          # JIDU6J01 which needs a runtime MFG-partition scan.
+          mkdir -p src/files/etc/uci-defaults src/files/etc/custom-pkgs
+          cp jidu6j11-src/99-jiorouter-jidu6j11-setup.txt src/files/etc/uci-defaults/99-custom-config
+          chmod +x src/files/etc/uci-defaults/99-custom-config
+          cp jidu6j11-src/custom-pkgs/*.apk src/files/etc/custom-pkgs/
+
+      - name: Write .config (target + full package list)
+        working-directory: src
+        run: |
+          {
+            echo "CONFIG_TARGET_qualcommbe=y"
+            echo "CONFIG_TARGET_qualcommbe_ipq95xx=y"
+            echo "CONFIG_TARGET_qualcommbe_ipq95xx_DEVICE_jiorouter_ax6000-jidu6j11-${{ matrix.device }}=y"
+            echo "# CONFIG_PACKAGE_luci-app-attendedsysupgrade is not set"
+            echo "# CONFIG_PACKAGE_attendedsysupgrade-common is not set"
+            for pkg in $(cat ../jidu6j11-src/packages.txt); do
+              echo "CONFIG_PACKAGE_${pkg}=y"
+            done
+          } > .config
+
+      - name: Update feeds
+        working-directory: src
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Make defconfig
+        working-directory: src
+        run: make defconfig
+
+      - name: Download sources
+        working-directory: src
+        run: make download -j$(nproc)
+
+      - name: Build firmware
+        working-directory: src
+        run: |
+          make -j$(nproc) || make -j1 V=s
+
+      - name: Collect artifacts
+        working-directory: src
+        run: |
+          mkdir -p ../out
+          echo "Full image output directory:"
+          ls -la bin/targets/qualcommbe/ipq95xx/ || true
+          # Grab any file whose name contains this exact device variant
+          # string — safer than guessing the suffix convention, since
+          # these filenames always embed the device name and won't
+          # collide with another variant's files.
+          find bin/targets/qualcommbe/ipq95xx/ -maxdepth 1 -type f \
+            -name "*jidu6j11-${{ matrix.device }}*" \
+            -exec cp {} ../out/ \;
+          echo "Collected:"
+          ls -la ../out/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jidu6j11-${{ matrix.device }}
+          path: out/*
+
+  release:
+    needs: build
+    # Without this, a single failed matrix variant in "build" (e.g. one
+    # device hitting a flaky upstream mirror) marks the whole "build"
+    # job as failed, and this entire release job — for ALL devices,
+    # including the ones that built fine — gets silently skipped.
+    # !cancelled() lets it run whenever build wasn't manually cancelled,
+    # regardless of individual variant success/failure.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        device: [6111, 6411, 6611, 6811, 6911]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: jidu6j11-${{ matrix.device }}
+          path: release-files
+
+      - name: Skip note if this device has no artifact
+        if: steps.download.outcome != 'success'
+        run: echo "::warning::No build artifact for ${{ matrix.device }} (its build job likely failed) — skipping release for this device."
+
+      - name: Delete old release (if exists)
+        if: steps.download.outcome == 'success'
+        run: |
+          gh release delete jidu6j11-${{ matrix.device }} --yes --cleanup-tag 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create release
+        if: steps.download.outcome == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: jidu6j11-${{ matrix.device }}
+          name: JIDU6J11-${{ matrix.device }} (snapshot)
+          make_latest: false
+          files: release-files/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
